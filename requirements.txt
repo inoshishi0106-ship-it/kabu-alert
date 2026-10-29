@@ -1,0 +1,8 @@
+requests
+yfinance
+anthropic
+beautifulsoup4
+pypdf
+pandas
+xlrd
+openpyxl
