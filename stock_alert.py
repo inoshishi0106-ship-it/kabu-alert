@@ -34,7 +34,8 @@ SCORE_MIN = 60               # この点数以上をLINEに送る（0〜100）
 MAX_CANDIDATES = 15          # 1回の実行でClaudeに読ませるIR・決算の最大件数
 MAX_JUDGE_PER_DAY = 150      # 1日にClaudeに読ませる最大件数（費用の上限）
 MAX_ITEMS_PER_PUSH = 5       # 1回のLINE通知にまとめる最大件数（吹き出し5個まで）
-MAX_PUSH_PER_DAY = 6         # 1日のLINE通知の最大回数（無料枠:月200通を守るため）
+MONTHLY_PUSH_LIMIT = 190     # 1か月のLINE通知の最大回数（無料枠:月200通。少し余裕を残す）
+EVENING_RESERVE = 3          # 15時以降の決算・夕方のニュース用に、1日の枠から残しておく回数
 MAX_AGE_HOURS = 18           # これより古いIRは判断しない（もう遅いので）
 THEME_EVERY_MIN = 60         # ニュースのテーマ株チェックを何分ごとにするか
 THEME_HOURS = (7, 22)        # テーマ株チェックをする時間帯（7時〜22時）
@@ -115,7 +116,11 @@ THEME_PROMPT = """あなたは日本株のテーマ株に詳しいアナリス�
 （例: 海底でレアアース発見 → 資源開発・探査の関連株、大規模な情報漏洩 → セキュリティ株、のように、
 ニュースから連想される業界まで考えてください。まだ株価で話題になっていない新しいニュースほど重視してください）
 それぞれ、そのテーマで直接恩恵を受けそうな東証上場の会社を最大4社挙げてください。
-- 小型・中型株を優先してください
+- ニュースに名前が出た会社だけでなく、「連想」で恩恵を受ける会社も挙げてください。
+  例: 大手の自動運転レベル4の実証拡大 → 高精度3次元地図・センサー・制御ソフトを供給する会社
+      大手の情報漏えい → セキュリティ製品・診断サービスの会社
+  ニュースに出た大企業より、その技術や部品を支える小型株の方がよく動きます
+- 小型・中型株、最近上場した会社も優先してください
 - 証券コード（4桁、例 3905 や 485A）に自信がない会社は挙げないでください
 - ニュースに根拠がないテーマは作らないでください。該当がなければ空にしてください
 - 情報整理の目的で、投資助言ではありません
@@ -163,7 +168,24 @@ def load_state():
     s.setdefault("judged", {})     # 日付 → Claudeに読ませた件数
     s.setdefault("theme_sent", {})  # 日付 → その日テーマで通知した銘柄コード
     s.setdefault("theme_last", "")
+    s.setdefault("push_month", {})  # 年月 → LINE通知の回数
     return s
+
+
+def push_allowance(state, now):
+    """今日、あと何回LINEに送ってよいか。月の残り枠を残りの日数で割って決める。"""
+    month = now.strftime("%Y-%m")
+    used_month = state["push_month"].get(month, 0)
+    used_today = state["push"].get(now.date().isoformat(), 0)
+    nxt = (now.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+    days_left = (nxt.date() - now.date()).days          # 今日を含む残り日数
+    left = MONTHLY_PUSH_LIMIT - (used_month - used_today)  # 今日の分を戻した残り枠
+    daily = max(3, min(15, left // max(days_left, 1)))
+    if now.hour < 15:
+        daily = max(1, daily - EVENING_RESERVE)   # 夕方の決算用に残しておく
+    if used_month >= MONTHLY_PUSH_LIMIT:
+        return 0, daily
+    return max(0, daily - used_today), daily
 
 
 def save_state(state, today):
@@ -171,6 +193,8 @@ def save_state(state, today):
     keep = today.isoformat()
     for k in ("push", "judged", "theme_sent"):
         state[k] = {keep: state[k].get(keep, 0 if k != "theme_sent" else [])}
+    m = today.strftime("%Y-%m")
+    state["push_month"] = {m: state["push_month"].get(m, 0)}
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
 
@@ -319,8 +343,8 @@ def pick_candidates(rows, seen, now):
         t = disclosed_at(r)
         r["old"] = bool(t and (now - t).total_seconds() > MAX_AGE_HOURS * 3600)
         out.append(r)
-    # 新しい順
-    out.sort(key=lambda r: (r.get("day", ""), r["time"]), reverse=True)
+    # IR（上方修正・提携など）を先に、その中で新しい順。決算はそのあと新しい順
+    out.sort(key=lambda r: (r["kind"] == "IR", r.get("day", ""), r["time"]), reverse=True)
     return out
 
 
@@ -579,22 +603,42 @@ def main():
 
     # ---- LINEに送る ----
     sent = 0
-    if send and alerts:
-        alerts.sort(key=lambda a: a["score"], reverse=True)
-        pushes = state["push"].get(key, 0)
-        if pushes >= MAX_PUSH_PER_DAY:
-            print(f"\n（今日のLINE通知は上限の{MAX_PUSH_PER_DAY}回に達したため、送りません）")
+    # 前回、枠がなくて送れなかったもの（3時間以内）も一緒に送る
+    pending = [p for p in state.get("pending", [])
+               if (now - dt.datetime.fromisoformat(p["at"])).total_seconds() < 3 * 3600]
+    for a in alerts:
+        a["at"] = now.isoformat()
+    queue = sorted(pending + alerts, key=lambda a: a["score"], reverse=True)
+    state["pending"] = []
+    if send and queue:
+        can, daily = push_allowance(state, now)
+        if can <= 0:
+            print(f"\n（今日のLINE通知は {daily} 回まで。枠が空いたら次の実行で送ります）")
+            state["pending"] = queue[:10]
         else:
-            batch = [a["text"] for a in alerts[:MAX_ITEMS_PER_PUSH]]
-            code, body = send_line(token, user_id, batch)
-            print(f"\nLINE送信: {code}（{len(batch)}件をまとめて1回で送信）")
+            # 1回の通知に吹き出し5個まで。1つの吹き出しに何件か詰めて、なるべく多く送る
+            bubbles, batch = [], []
+            for a in queue:
+                if bubbles and len(bubbles[-1]) + len(a["text"]) + 10 <= 4800:
+                    bubbles[-1] += "\n\n――――――\n\n" + a["text"]
+                elif len(bubbles) < 5:
+                    bubbles.append(a["text"])
+                else:
+                    break
+                batch.append(a)
+            code, body = send_line(token, user_id, bubbles)
+            print(f"\nLINE送信: {code}（{len(batch)}件を{len(bubbles)}個の吹き出しにまとめて1回で送信／今日の枠 {daily} 回）")
             if code == 200:
                 sent = len(batch)
-                state["push"][key] = pushes + 1
+                state["push"][key] = state["push"].get(key, 0) + 1
+                m = now.strftime("%Y-%m")
+                state["push_month"][m] = state["push_month"].get(m, 0) + 1
                 state["theme_sent"].setdefault(key, [])
-                state["theme_sent"][key] += theme_codes
+                state["theme_sent"][key] += [a["code"] for a in batch if a.get("code")]
+                state["pending"] = queue[len(batch):len(batch) + 10]  # 入りきらなかった分は次回
             else:
                 print(body[:300])
+                state["pending"] = queue[:10]
 
     if send:
         # 画面表示のみのときは「見た」扱いにしない（再実行できるように）
