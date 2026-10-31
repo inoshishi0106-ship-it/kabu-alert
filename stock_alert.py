@@ -31,8 +31,8 @@ from pypdf import PdfReader
 MODEL = "claude-haiku-5-5"   # 判断に使うClaudeのモデル（安くて速いもの）
 PRICE_MAX = 5000             # 株価の上限（円）
 SCORE_MIN = 60               # この点数以上をLINEに送る（0〜100）
-MAX_CANDIDATES = 15          # 1回の実行でClaudeに読ませるIR・決算の最大件数
-MAX_JUDGE_PER_DAY = 150      # 1日にClaudeに読ませる最大件数（費用の上限）
+MAX_CANDIDATES = 30          # 1回の実行でClaudeに読ませるIR・決算の最大件数
+MAX_JUDGE_PER_DAY = 400     # 1日にClaudeに読ませる最大件数（費用の上限。1件0.1円ほど）
 MAX_ITEMS_PER_PUSH = 5       # 1回のLINE通知にまとめる最大件数（吹き出し5個まで）
 MONTHLY_PUSH_LIMIT = 190     # 1か月のLINE通知の最大回数（無料枠:月200通。少し余裕を残す）
 EVENING_RESERVE = 3          # 15時以降の決算・夕方のニュース用に、1日の枠から残しておく回数
