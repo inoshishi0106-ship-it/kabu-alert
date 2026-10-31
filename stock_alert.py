@@ -28,7 +28,11 @@ from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
 # ===== 設定（必要ならここを変えます） =====
-MODEL = "claude-haiku-5-5"   # 判断に使うClaudeのモデル（安くて速いもの）
+MODEL = "claude-haiku-5-5"   # 一次チェックに使うClaudeのモデル（安くて速いもの）
+MODEL_CHECK = "claude-sonnet-5-5"  # 二次チェック（基準点以上だけ読み直す、賢いモデル）
+HISTORY_SCORE_MIN = 50       # この点数以上は、送らなくても記録する（基準点の比較用）
+NIGHT_HOURS = (22, 8)        # この時間帯の通知は貯めて、朝8時にまとめて送る
+WEEKLY_REPORT_DAY = 5        # 週のまとめを送る曜日（0=月 … 5=土）
 PRICE_MAX = 5000             # 株価の上限（円）
 SCORE_MIN = 60               # この点数以上をLINEに送る（0〜100）
 MAX_CANDIDATES = 30          # 1回の実行でClaudeに読ませるIR・決算の最大件数
@@ -169,7 +173,100 @@ def load_state():
     s.setdefault("theme_sent", {})  # 日付 → その日テーマで通知した銘柄コード
     s.setdefault("theme_last", "")
     s.setdefault("push_month", {})  # 年月 → LINE通知の回数
+    s.setdefault("pending", [])     # 送れなかった通知・夜の間に貯めた通知
+    s.setdefault("digest_done", "")  # 朝のまとめを送った日
+    s.setdefault("weekly_done", "")  # 週のまとめを送った日
     return s
+
+
+# ---------------- ② 成績の記録 ----------------
+def load_history(state):
+    return state.setdefault("history", [])
+
+
+def prune_history(state, today):
+    cutoff = (today - dt.timedelta(days=45)).isoformat()
+    state["history"] = [h for h in state.get("history", []) if h["date"] >= cutoff]
+
+
+def record(hist, now, code, name, kind, score, price, sent):
+    d = now.date().isoformat()
+    for h in hist:
+        if h["date"] == d and h["code"] == code and h["kind"] == kind:
+            h["sent"] = h["sent"] or sent   # 同じ日・同じ銘柄は1回だけ記録
+            return
+    hist.append({"date": now.date().isoformat(), "time": now.strftime("%H:%M"), "code": code,
+                 "name": name, "kind": kind, "score": score, "price": round(price, 1),
+                 "sent": sent})
+
+
+def after_moves(code, date_str, price):
+    """通知した日のあと、翌営業日の終値・3営業日以内の高値・3営業日後の終値の変化率(%)。"""
+    try:
+        df = yf.Ticker(code + ".T").history(period="1mo", interval="1d")
+    except Exception:
+        return None
+    if df is None or df.empty or not price:
+        return None
+    d0 = dt.date.fromisoformat(date_str)
+    after = df[[ix.date() > d0 for ix in df.index]]
+    if len(after) < 1:
+        return None
+    r = {"next": (after["Close"].iloc[0] / price - 1) * 100}
+    if len(after) >= 3:
+        r["high3"] = (after["High"].iloc[:3].max() / price - 1) * 100
+        r["close3"] = (after["Close"].iloc[2] / price - 1) * 100
+    return r
+
+
+def weekly_report(hist, today):
+    """直近2週間の記録から、成績のまとめ文章を作る。"""
+    start = (today - dt.timedelta(days=14)).isoformat()
+    rows = [dict(h) for h in hist if start <= h["date"] < today.isoformat()]
+    if not rows:
+        return None
+    cache = {}
+    for h in rows:
+        k = (h["code"], h["date"], h["price"])
+        if k not in cache:
+            cache[k] = after_moves(h["code"], h["date"], h["price"])
+        h["_m"] = cache[k]
+    done = [h for h in rows if h["_m"]]
+    if not done:
+        return None
+
+    def line(label, group):
+        g = [h for h in group if h["_m"]]
+        if not g:
+            return None
+        nxt = [h["_m"]["next"] for h in g]
+        win = sum(1 for x in nxt if x > 0)
+        hi = [h["_m"]["high3"] for h in g if "high3" in h["_m"]]
+        s = f"{label}: {len(g)}件 翌日上昇 {win}/{len(g)}（{win * 100 // len(g)}%） 翌日平均 {sum(nxt) / len(nxt):+.1f}%"
+        if hi:
+            s += f" 3日内の高値 平均 {sum(hi) / len(hi):+.1f}%"
+        return s
+
+    out = [f"【今週の成績】直近2週間（{start}〜）", "", "■ 点数別"]
+    for lo, hi_, label in ((80, 101, "80点以上"), (70, 80, "70〜79点"), (60, 70, "60〜69点"),
+                           (50, 60, "50〜59点（送っていない）")):
+        s = line(label, [h for h in done if lo <= h["score"] < hi_])
+        if s:
+            out.append(s)
+    out += ["", "■ 種類別"]
+    for kind in ("IR", "決算", "テーマ株"):
+        s = line(kind, [h for h in done if h["kind"] == kind and h["sent"]])
+        if s:
+            out.append(s)
+    best = sorted([h for h in done if h["sent"] and "high3" in h["_m"]],
+                  key=lambda h: h["_m"]["high3"], reverse=True)[:3]
+    if best:
+        out += ["", "■ よく上がった通知"]
+        for h in best:
+            out.append(f"{h['code']} {h['name']}（{h['kind']} {h['score']}点・{h['date'][5:]}）"
+                       f" 3日内の高値 {h['_m']['high3']:+.1f}%")
+    out += ["", "※通知したときの株価からの変化です。基準点を変えたいときの参考にしてください。"]
+    return "\n".join(out)
 
 
 def push_allowance(state, now):
@@ -199,9 +296,9 @@ def save_state(state, today):
         json.dump(state, f, ensure_ascii=False)
 
 
-def ask_claude(client, prompt, max_tokens=3000):
+def ask_claude(client, prompt, max_tokens=3000, model=None):
     resp = client.messages.create(
-        model=MODEL, max_tokens=max_tokens,
+        model=model or MODEL, max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
     )
     # 返事には「考え中」のブロックが混ざることがあるので、文章のブロックだけ集める
@@ -378,6 +475,25 @@ def judge_ir(client, r, info, body):
         data["score"] = int(data["score"])
     except Exception:
         return None
+    data["first"] = data["score"]
+    return data
+
+
+def recheck_ir(client, r, info, body, res):
+    """④ 一次チェックで基準点以上だったものを、賢いモデルでもう一度読み直す。"""
+    prompt = PROMPT.format(
+        kind="決算短信" if r["kind"] == "決算" else "IR",
+        code=r["code"], name=r["name"], time=r["time"], title=r["title"],
+        price=f"{info['close']:.0f}", chg=info["chg"], vol=info["vol"],
+        body=body or "（本文を取得できませんでした。題名だけで判断してください）",
+    ) + "\n厳しめに採点してください。数字の読み違いや、すでに知られている内容でないかも確認してください。\n"
+    try:
+        data = extract_json(ask_claude(client, prompt, model=MODEL_CHECK))
+        data["score"] = int(data["score"])
+    except Exception:
+        return res   # 読み直しに失敗したら、一次チェックの結果を使う
+    data["first"] = res["first"]
+    data["checked"] = True
     return data
 
 
@@ -385,7 +501,7 @@ def format_ir(r, info, res):
     moved = "\n※すでに動き出している可能性あり" if res.get("already_moved") else ""
     label = "決算" if r["kind"] == "決算" else "IR"
     return (
-        f"【{label} {res['score']}点】{r['code']} {r['name']}\n"
+        f"【{label} {res['score']}点{'（一次' + str(res['first']) + '→精査' + str(res['score']) + '）' if res.get('checked') else ''}】{r['code']} {r['name']}\n"
         f"株価 {info['close']:.0f}円（{info['chg']:+.1f}%） 出来高 {info['vol']:.1f}倍{moved}\n"
         f"{label}: {r['title'][:80]}（{r['time']}）\n"
         f"根拠: {res.get('reason', '')}\n"
@@ -422,6 +538,7 @@ def fetch_news(now):
 
 def theme_alerts(client, now, state, jpx, score_min):
     """ニュースからテーマ株を探して、送る候補のリストを返す。"""
+    theme_alerts.recorded = []
     news = fetch_news(now)
     print(f"\n■ ニュースのテーマ株チェック（直近{NEWS_HOURS}時間の見出し {len(news)} 件）")
     if len(news) < 3:
@@ -464,23 +581,40 @@ def theme_alerts(client, now, state, jpx, score_min):
     res = extract_json(ask_claude(client, THEME_SCORE_PROMPT.format(items="\n".join(lines))))
     scores = {str(x.get("code", "")).upper(): x for x in (res or {}).get("items", [])}
 
+    # ④ 基準点以上だったものだけ、賢いモデルでまとめて読み直す
+    passed = [ln for c, ln in zip(cands, lines)
+              if c["code"] in scores and _int(scores[c["code"]].get("score")) >= score_min]
+    checked = {}
+    if passed:
+        try:
+            res2 = extract_json(ask_claude(
+                client, THEME_SCORE_PROMPT.format(items="\n".join(passed))
+                + "\n厳しめに採点してください。会社とテーマの関係が本当にあるか、"
+                  "すでに大きく上がった後でないかも確認してください。\n",
+                model=MODEL_CHECK))
+            checked = {str(x.get("code", "")).upper(): x for x in (res2 or {}).get("items", [])}
+        except Exception as e:
+            print(f"  （読み直しでエラー: {e}。一次チェックの結果を使います）")
+
     out = []
     for c in cands:
         x = scores.get(c["code"])
         if not x:
             continue
-        try:
-            sc = int(x.get("score", 0))
-        except Exception:
-            continue
+        sc = first = _int(x.get("score"))
+        if c["code"] in checked:
+            x = checked[c["code"]]
+            sc = _int(x.get("score"))
         i = c["info"]
         flag = "★送信対象" if sc >= score_min else "  見送り"
-        print(f"{flag} {sc:>3}点  {c['code']} {c['name']}  {i['close']:.0f}円 ({i['chg']:+.1f}%) 出来高{i['vol']:.1f}倍  [{c['theme']}]")
+        two = f"（一次{first}→精査{sc}）" if c["code"] in checked else ""
+        print(f"{flag} {sc:>3}点{two}  {c['code']} {c['name']}  {i['close']:.0f}円 ({i['chg']:+.1f}%) 出来高{i['vol']:.1f}倍  [{c['theme']}]")
         print(f"        根拠: {x.get('reason', '')}")
+        c.update(score=sc, sent=sc >= score_min)
         if sc >= score_min:
             moved = "\n※すでに動き出している可能性あり" if x.get("already_moved") else ""
             text = (
-                f"【テーマ株 {sc}点】{c['code']} {c['name']}\n"
+                f"【テーマ株 {sc}点{two}】{c['code']} {c['name']}\n"
                 f"株価 {i['close']:.0f}円（{i['chg']:+.1f}%） 出来高 {i['vol']:.1f}倍{moved}\n"
                 f"テーマ: {c['theme']}\n"
                 f"ニュース: {c['news']}\n"
@@ -488,7 +622,16 @@ def theme_alerts(client, now, state, jpx, score_min):
                 f"注意: {x.get('risk', '')}（銘柄の関係はClaudeの推定です。ご自身でも確認してください）"
             )
             out.append({"score": sc, "text": text, "code": c["code"]})
+    # 記録用（50点以上）
+    theme_alerts.recorded = [c for c in cands if "score" in c and c["score"] >= HISTORY_SCORE_MIN]
     return out
+
+
+def _int(v):
+    try:
+        return int(v)
+    except Exception:
+        return 0
 
 
 # ---------------- LINE ----------------
@@ -535,6 +678,7 @@ def main():
     key = today.isoformat()
     judged_today = state["judged"].get(key, 0)
     alerts = []   # {"score", "text"}
+    hist = load_history(state)   # ② 成績の記録（alert_state.json の中に保存）
 
     # ---- ① IR・決算 ----
     rows = []
@@ -564,23 +708,30 @@ def main():
         if not info or info["close"] > PRICE_MAX:
             seen.add(r["url"])
             continue
-        res = judge_ir(client, r, info, pdf_head(r["url"]))
+        body = pdf_head(r["url"])
+        res = judge_ir(client, r, info, body)
         judged += 1
         judged_today += 1
         seen.add(r["url"])
         if not res:
             print(f"[{r['code']} {r['name']}] 判断結果を読み取れませんでした")
             continue
+        if res["score"] >= score_min:
+            res = recheck_ir(client, r, info, body, res)   # ④ 賢いモデルで読み直す
+            judged_today += 1
         flag = "★送信対象" if res["score"] >= score_min else "  見送り"
-        print(f"{flag} {res['score']:>3}点  [{r['kind']}] {r['code']} {r['name']}  {info['close']:.0f}円 ({info['chg']:+.1f}%) 出来高{info['vol']:.1f}倍")
+        two = f"（一次{res['first']}→精査{res['score']}）" if res.get("checked") else ""
+        print(f"{flag} {res['score']:>3}点{two}  [{r['kind']}] {r['code']} {r['name']}  {info['close']:.0f}円 ({info['chg']:+.1f}%) 出来高{info['vol']:.1f}倍")
         print(f"        {r['kind']}: {r['title'][:70]}")
         print(f"        根拠: {res.get('reason', '')}")
         print(f"        注意: {res.get('risk', '')}")
-        if res["score"] >= score_min:
-            alerts.append({"score": res["score"], "text": format_ir(r, info, res)})
+        ok = res["score"] >= score_min
+        if res["score"] >= HISTORY_SCORE_MIN or res["first"] >= HISTORY_SCORE_MIN:
+            record(hist, now, r["code"], r["name"], r["kind"], res["score"], info["close"], ok)
+        if ok:
+            alerts.append({"score": res["score"], "text": format_ir(r, info, res), "code": r["code"]})
 
-    # ---- ② ニュースのテーマ株（1時間に1回） ----
-    theme_codes = []
+    # ---- ニュースのテーマ株（1時間に1回） ----
     last = state.get("theme_last")
     due = True
     if last:
@@ -593,8 +744,9 @@ def main():
             jpx = load_jpx(today)
             got = theme_alerts(client, now, state, jpx, score_min)
             alerts += got
-            theme_codes = [g["code"] for g in got]
-            judged_today += 2
+            judged_today += 3
+            for c in getattr(theme_alerts, "recorded", []):
+                record(hist, now, c["code"], c["name"], "テーマ株", c["score"], c["info"]["close"], c["sent"])
         except Exception as e:
             print(f"  テーマ株チェックでエラー: {e}")
         state["theme_last"] = now.isoformat()
@@ -603,29 +755,62 @@ def main():
 
     # ---- LINEに送る ----
     sent = 0
-    # 前回、枠がなくて送れなかったもの（3時間以内）も一緒に送る
-    pending = [p for p in state.get("pending", [])
-               if (now - dt.datetime.fromisoformat(p["at"])).total_seconds() < 3 * 3600]
+    night = now.hour >= NIGHT_HOURS[0] or now.hour < NIGHT_HOURS[1]
+
+    def fresh(p):
+        age = (now - dt.datetime.fromisoformat(p["at"])).total_seconds()
+        return age < (14 if p.get("night") else 3) * 3600
+
+    pending = [p for p in state.get("pending", []) if fresh(p)]
     for a in alerts:
         a["at"] = now.isoformat()
-    queue = sorted(pending + alerts, key=lambda a: a["score"], reverse=True)
+        a["night"] = night
+    queue, seen_codes = [], set()
+    for a in sorted(pending + alerts, key=lambda a: a["score"], reverse=True):
+        if a.get("code") and a["code"] in seen_codes:
+            continue   # 同じ銘柄は1回だけ
+        seen_codes.add(a.get("code"))
+        queue.append(a)
     state["pending"] = []
-    if send and queue:
+
+    if send and queue and night:
+        # ③ 夜の間は送らずに貯めて、朝8時にまとめて送る
+        state["pending"] = queue[:30]
+        print(f"\n（夜の時間帯なので、{len(queue)}件を朝8時のまとめに回します）")
+    elif send and queue:
         can, daily = push_allowance(state, now)
         if can <= 0:
             print(f"\n（今日のLINE通知は {daily} 回まで。枠が空いたら次の実行で送ります）")
-            state["pending"] = queue[:10]
+            state["pending"] = queue[:30]
         else:
+            texts = [a["text"] for a in queue]
+            n_night = sum(1 for a in queue if a.get("night"))
+            if n_night and state.get("digest_done") != key:
+                # ③ 朝のまとめ: 先頭に見出しとClaudeの一言まとめを付ける
+                head = f"【おはようございます】夜〜朝の材料 {n_night}件（点数の高い順）"
+                try:
+                    summ = ask_claude(client, "次は夜から朝に出た日本株の材料の一覧です。"
+                                      "今日の寄り付きに向けて注目すべき点を、日本語で3行以内にまとめてください。"
+                                      "前置きや見出しは不要です。\n\n" + "\n\n".join(texts[:15])[:12000],
+                                      max_tokens=2000).strip()
+                    if summ:
+                        head += "\n\n" + summ[:600]
+                except Exception:
+                    pass
+                texts = [head] + texts
+                state["digest_done"] = key
             # 1回の通知に吹き出し5個まで。1つの吹き出しに何件か詰めて、なるべく多く送る
-            bubbles, batch = [], []
-            for a in queue:
-                if bubbles and len(bubbles[-1]) + len(a["text"]) + 10 <= 4800:
-                    bubbles[-1] += "\n\n――――――\n\n" + a["text"]
+            bubbles, used = [], 0
+            for t in texts:
+                if bubbles and len(bubbles[-1]) + len(t) + 10 <= 4800:
+                    bubbles[-1] += "\n\n――――――\n\n" + t
                 elif len(bubbles) < 5:
-                    bubbles.append(a["text"])
+                    bubbles.append(t)
                 else:
                     break
-                batch.append(a)
+                used += 1
+            n_items = used - (len(texts) - len(queue))   # 見出しの分を引く
+            batch = queue[:n_items]
             code, body = send_line(token, user_id, bubbles)
             print(f"\nLINE送信: {code}（{len(batch)}件を{len(bubbles)}個の吹き出しにまとめて1回で送信／今日の枠 {daily} 回）")
             if code == 200:
@@ -635,15 +820,39 @@ def main():
                 state["push_month"][m] = state["push_month"].get(m, 0) + 1
                 state["theme_sent"].setdefault(key, [])
                 state["theme_sent"][key] += [a["code"] for a in batch if a.get("code")]
-                state["pending"] = queue[len(batch):len(batch) + 10]  # 入りきらなかった分は次回
+                state["pending"] = queue[len(batch):len(batch) + 30]  # 入りきらなかった分は次回
             else:
                 print(body[:300])
-                state["pending"] = queue[:10]
+                state["pending"] = queue[:30]
+                if state.get("digest_done") == key and n_night:
+                    state["digest_done"] = ""
+
+    # ---- ② 週のまとめ（土曜の朝） ----
+    if (send and now.weekday() == WEEKLY_REPORT_DAY and now.hour >= 9
+            and state.get("weekly_done") != key):
+        try:
+            rep = weekly_report(hist, today)
+        except Exception as e:
+            rep = None
+            print(f"  週のまとめでエラー: {e}")
+        if rep:
+            code, body = send_line(token, user_id, [rep])
+            print(f"\n週のまとめをLINEに送信: {code}")
+            if code == 200:
+                m = now.strftime("%Y-%m")
+                state["push_month"][m] = state["push_month"].get(m, 0) + 1
+                state["push"][key] = state["push"].get(key, 0) + 1
+        else:
+            print("\n週のまとめ: まだ記録がありません")
+        state["weekly_done"] = key
+    elif not send and "--report" in sys.argv:
+        print("\n" + (weekly_report(hist, today) or "週のまとめ: まだ記録がありません"))
 
     if send:
         # 画面表示のみのときは「見た」扱いにしない（再実行できるように）
         state["seen"] = list(seen)
         state["judged"][key] = judged_today
+        prune_history(state, today)
         save_state(state, today)
     print(f"\nIR・決算を判断: {judged} 件 / 送信対象: {len(alerts)} 件 / LINEに送った件数: {sent}")
 
