@@ -34,7 +34,8 @@ HISTORY_SCORE_MIN = 50       # この点数以上は、送らなくても記録�
 NIGHT_HOURS = (22, 8)        # この時間帯の通知は貯めて、朝8時にまとめて送る
 WEEKLY_REPORT_DAY = 5        # 週のまとめを送る曜日（0=月 … 5=土）
 PRICE_MAX = 5000             # 株価の上限（円）
-SCORE_MIN = 60               # この点数以上をLINEに送る（0〜100）
+SCORE_MIN = 60               # この点数以上を通知する（0〜100）。Discordにはこれ以上を全部送る
+LINE_MIN = 70                # Discordを使うとき、LINEにはこの点数以上だけ送る（＋朝・週のまとめ）
 MAX_CANDIDATES = 30          # 1回の実行でClaudeに読ませるIR・決算の最大件数
 MAX_JUDGE_PER_DAY = 400     # 1日にClaudeに読ませる最大件数（費用の上限。1件0.1円ほど）
 MAX_ITEMS_PER_PUSH = 5       # 1回のLINE通知にまとめる最大件数（吹き出し5個まで）
@@ -635,6 +636,33 @@ def _int(v):
 
 
 # ---------------- LINE ----------------
+def send_discord(url, texts):
+    """Discordのウェブフックに送る。1通2000文字までなので、詰めて分ける。回数制限なし（無料）。"""
+    import time
+    msgs = []
+    for t in texts:
+        t = t[:1900]
+        if msgs and len(msgs[-1]) + len(t) + 20 <= 1950:
+            msgs[-1] += "\n\n――――――\n\n" + t
+        else:
+            msgs.append(t)
+    ok = True
+    for m in msgs:
+        try:
+            r = requests.post(url, json={"content": m}, timeout=15)
+            if r.status_code == 429:   # 送りすぎで待たされたとき
+                time.sleep(float(r.json().get("retry_after", 2)) + 0.5)
+                r = requests.post(url, json={"content": m}, timeout=15)
+            ok = ok and r.status_code in (200, 204)
+            if r.status_code not in (200, 204):
+                print(f"  Discord送信エラー: {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            print(f"  Discord送信エラー: {e}")
+            ok = False
+        time.sleep(0.6)
+    return ok
+
+
 def send_line(token, user_id, texts):
     msgs = [{"type": "text", "text": t[:4900]} for t in texts[:5]]
     r = requests.post(
@@ -753,6 +781,17 @@ def main():
     else:
         print("\n■ ニュースのテーマ株チェックは、今回はお休み（1時間に1回／7時〜22時）")
 
+    # ---- ⑤ Discordに送る（60点以上を全部、すぐに） ----
+    discord = os.environ.get("DISCORD_WEBHOOK", "").strip()
+    if send and discord and alerts:
+        ds = sorted(alerts, key=lambda a: a["score"], reverse=True)
+        if send_discord(discord, [a["text"] for a in ds]):
+            print(f"\nDiscordに {len(ds)} 件送信しました")
+            state["theme_sent"].setdefault(key, [])
+            state["theme_sent"][key] += [a["code"] for a in ds if a.get("code")]
+    if discord:
+        alerts = [a for a in alerts if a["score"] >= LINE_MIN]   # LINEは高い点数だけ
+
     # ---- LINEに送る ----
     sent = 0
     night = now.hour >= NIGHT_HOURS[0] or now.hour < NIGHT_HOURS[1]
@@ -836,6 +875,8 @@ def main():
             rep = None
             print(f"  週のまとめでエラー: {e}")
         if rep:
+            if discord:
+                send_discord(discord, [rep])
             code, body = send_line(token, user_id, [rep])
             print(f"\n週のまとめをLINEに送信: {code}")
             if code == 200:
