@@ -194,8 +194,9 @@ def record(hist, now, code, name, kind, score, price, sent):
     d = now.date().isoformat()
     for h in hist:
         if h["date"] == d and h["code"] == code and h["kind"] == kind:
-            h["sent"] = h["sent"] or sent   # 同じ日・同じ銘柄は1回だけ記録
-            return
+            if sent and not h["sent"]:   # あとで送った回の点数・株価で記録し直す
+                h.update(time=now.strftime("%H:%M"), score=score, price=round(price, 1), sent=True)
+            return   # 同じ日・同じ銘柄は1回だけ記録
     hist.append({"date": now.date().isoformat(), "time": now.strftime("%H:%M"), "code": code,
                  "name": name, "kind": kind, "score": score, "price": round(price, 1),
                  "sent": sent})
@@ -803,7 +804,9 @@ def main():
             state["theme_sent"].setdefault(key, [])
             state["theme_sent"][key] += [a["code"] for a in ds if a.get("code")]
     if discord:
-        alerts = [a for a in alerts if a["score"] >= LINE_MIN]   # LINEは高い点数だけ
+        # LINEは高い点数だけ。ただし夜〜朝の分は、朝8時のまとめに入れるので点数に関係なく残す
+        is_night = now.hour >= NIGHT_HOURS[0] or now.hour < NIGHT_HOURS[1]
+        alerts = [a for a in alerts if a["score"] >= LINE_MIN or is_night]
 
     # ---- LINEに送る ----
     sent = 0
