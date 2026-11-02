@@ -98,7 +98,10 @@ PROMPT = """あなたは日本の小型株に詳しい株式アナリストで�
 【銘柄】{code} {name}
 【開示時刻】{time}
 【題名】{title}
-【現在の株価】{price}円（前日比 {chg:+.1f}%）／出来高は直近20日平均の {vol:.1f}倍
+【現在の株価】{price}円（前日比 {chg:+.1f}%）／出来高は直近20日平均の {vol:.1f}倍（取引時間中は1日分に換算した目安）
+※株価は最大20分ほど遅れています。開示直後の場合、この株価・出来高はまだ開示に反応する前の数字です。
+  開示から30分以内なら、株価や出来高が動いていないことを「織り込み前」の根拠にしないでください。
+  東証の取引時間は9:00〜11:30、12:30〜15:30です。
 【開示本文の冒頭】
 {body}
 
@@ -326,9 +329,20 @@ def price_info(code):
             return None
         last = df.iloc[-1]
         vol_avg = df["Volume"].iloc[:-1].tail(20).mean()
+        vol = float(last["Volume"] / vol_avg) if vol_avg else 0.0
+        # 取引時間中は、その日の出来高がまだ途中なので、経過時間で1日分に引き直す
+        now = dt.datetime.now(JST)
+        if df.index[-1].date() == now.date() and now.weekday() < 5:
+            mins = 0
+            for a, b in (((9, 0), (11, 30)), ((12, 30), (15, 30))):
+                st = now.replace(hour=a[0], minute=a[1], second=0, microsecond=0)
+                en = now.replace(hour=b[0], minute=b[1], second=0, microsecond=0)
+                mins += max(0, (min(now, en) - st).total_seconds() / 60)
+            if 0 < mins < 300:
+                vol = vol * 300 / max(mins, 30)
         return {
             "close": float(last["Close"]),
-            "vol": float(last["Volume"] / vol_avg) if vol_avg else 0.0,
+            "vol": vol,
             "chg": float((last["Close"] / df["Close"].iloc[-2] - 1) * 100),
         }
     except Exception:
@@ -798,7 +812,12 @@ def main():
     # ---- ⑤ Discordに送る（60点以上を全部、すぐに） ----
     discord = os.environ.get("DISCORD_WEBHOOK", "").strip()
     if send and discord and alerts:
-        ds = sorted(alerts, key=lambda a: a["score"], reverse=True)
+        ds, dcodes = [], set()
+        for a in sorted(alerts, key=lambda a: a["score"], reverse=True):
+            if a.get("code") and a["code"] in dcodes:
+                continue   # 同じ銘柄（IRと決算など）は、点数の高い方だけ送る
+            dcodes.add(a.get("code"))
+            ds.append(a)
         if send_discord(discord, [a["text"] for a in ds]):
             print(f"\nDiscordに {len(ds)} 件送信しました")
             state["theme_sent"].setdefault(key, [])
