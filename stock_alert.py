@@ -690,12 +690,25 @@ def main():
     if send:
         token = get_secret("LINE_TOKEN", "LINEのトークンを貼り付けてEnter")
         user_id = get_secret("LINE_USER_ID", "LINEのユーザーIDを貼り付けてEnter")
-        chk = requests.get("https://api.line.me/v2/bot/info",
-                           headers={"Authorization": f"Bearer {token}"}, timeout=15)
-        if chk.status_code != 200:
-            print(f"\n★LINEのトークンが正しくありません（コード {chk.status_code}）。")
+        # LINEのトークン確認。一時的な通信の失敗では止めず、トークンが本当に違うとき(401/403)だけ止める
+        import time
+        code = None
+        for i in range(3):
+            try:
+                code = requests.get("https://api.line.me/v2/bot/info",
+                                    headers={"Authorization": f"Bearer {token}"}, timeout=15).status_code
+            except Exception as e:
+                print(f"  LINEの確認で通信エラー（{i + 1}回目）: {e}")
+                code = None
+            if code in (200, 401, 403):
+                break
+            time.sleep(5)
+        if code in (401, 403):
+            print(f"\n★LINEのトークンが正しくありません（コード {code}）。")
             print("  LINE Developersでトークンを再発行して、もう一度実行してください。")
             sys.exit(1)
+        if code != 200:
+            print(f"  （LINEの確認ができませんでした: {code}。チェックはこのまま続けます）")
         if not user_id.startswith("U"):
             print("\n★ユーザーIDは U から始まる文字です。もう一度実行してください。")
             sys.exit(1)
