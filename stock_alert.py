@@ -650,6 +650,91 @@ def _int(v):
         return 0
 
 
+# ---------------- ⑤ 気になる銘柄（登録銘柄） ----------------
+import hashlib
+
+
+def hkey(*parts):
+    """記録に銘柄コードが残らないよう、目印は短い暗号のような文字にして保存する（公開の置き場所のため）。"""
+    return hashlib.sha1("|".join(str(p) for p in parts).encode()).hexdigest()[:16]
+
+
+def load_watch():
+    """GitHubのSecrets「WATCH_CODES」に書いた証券コード（例: 3905,4588,485A,6613）を読む。"""
+    raw = os.environ.get("WATCH_CODES", "")
+    if not raw and os.path.exists("watchlist.txt"):
+        raw = open("watchlist.txt", encoding="utf-8").read()
+    codes = [c.strip().upper() for c in re.split(r"[\s,、]+", raw) if c.strip()]
+    return [c for c in codes if re.fullmatch(r"[0-9][0-9A-Z]{3}", c)]
+
+
+def load_kessan_schedule(state, today):
+    """JPXの「決算発表予定日」一覧（Excel）を読み、{コード: 日付} を返す。1日1回だけ取り直す。"""
+    cache = state.get("ksched", {})
+    if cache.get("date") == today.isoformat():
+        return cache.get("map", {})   # 中身は {暗号化したコード: 日付}
+    out = {}
+    try:
+        import pandas as pd
+        page = "https://www.jpx.co.jp/listing/event-schedules/financial-announcement/index.html"
+        p = requests.get(page, headers=HEADERS, timeout=30)
+        links = list(dict.fromkeys(re.findall(r'href="([^"]+\.xlsx?)"', p.text)))
+        for ln in links[:6]:
+            url = urllib.parse.urljoin(page, ln)
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            df = pd.read_excel(io.BytesIO(r.content), header=None)
+            for _, row in df.iterrows():
+                cells = [str(x).strip() for x in row.tolist()]
+                code = next((c[:-2] if c.endswith(".0") else c for c in cells
+                             if re.fullmatch(r"[0-9][0-9A-Z]{3}(\.0)?", c)), None)
+                date = None
+                for x in row.tolist():
+                    if hasattr(x, "year") and not isinstance(x, str):
+                        try:
+                            date = pd.Timestamp(x).date()
+                            break
+                        except Exception:
+                            pass
+                    m = re.search(r"(20\d\d)[/年-](\d{1,2})[/月-](\d{1,2})", str(x))
+                    if m:
+                        date = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                        break
+                if code and date:
+                    out[hkey("code", code)] = date.isoformat()
+    except Exception as e:
+        print(f"  （決算発表予定日を取得できませんでした: {e}）")
+        return cache.get("map", {})
+    if out:
+        state["ksched"] = {"date": today.isoformat(), "map": out}
+    return out
+
+
+def watch_news(codes, names, now):
+    """登録銘柄の会社名で、直近の見出しを集める。"""
+    out = []
+    for c in codes:
+        nm = names.get(c)
+        if not nm:
+            continue
+        q = urllib.parse.quote(f'"{nm}"')
+        url = f"https://news.google.com/rss/search?q={q}+when:1d&hl=ja&gl=JP&ceid=JP:ja"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            root = ET.fromstring(r.content)
+        except Exception:
+            continue
+        for item in list(root.iter("item"))[:5]:
+            t = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            try:
+                when = parsedate_to_datetime(item.findtext("pubDate")).astimezone(JST)
+            except Exception:
+                continue
+            if (now - when).total_seconds() <= 6 * 3600:
+                out.append({"code": c, "name": nm, "title": t, "link": link, "when": when})
+    return out
+
+
 # ---------------- LINE ----------------
 def send_discord(url, texts):
     """Discordのウェブフックに送る。1通2000文字までなので、詰めて分ける。回数制限なし（無料）。"""
@@ -787,6 +872,66 @@ def main():
         if ok:
             alerts.append({"score": res["score"], "text": format_ir(r, info, res), "code": r["code"]})
 
+    # ---- ⑤ 登録銘柄: IRは点数・株価に関係なく全部、ニュースと決算日も知らせる ----
+    watch = load_watch()
+    watch_msgs = []
+    if watch:
+        wseen = set(state.get("wseen", []))
+        names = {}
+        for r in rows:
+            if r["code"] in watch:
+                names[r["code"]] = r["name"]
+        try:
+            jpx_names = load_jpx(today) or {}
+        except Exception:
+            jpx_names = {}
+        for c in watch:
+            names.setdefault(c, jpx_names.get(c, ""))
+        # IR・決算（全部）
+        for r in rows:
+            if r["code"] not in watch:
+                continue
+            k = hkey("ir", r["url"])
+            if k in wseen:
+                continue
+            wseen.add(k)
+            t = disclosed_at(r)
+            if t and (now - t).total_seconds() > 36 * 3600:
+                continue
+            info = price_info(r["code"]) or {"close": 0, "chg": 0, "vol": 0}
+            msg = (f"【登録銘柄のIR】{r['code']} {r['name']}\n"
+                   f"{r['title'][:90]}（{r['day'][4:6]}/{r['day'][6:]} {r['time']}）\n"
+                   f"株価 {info['close']:.0f}円（{info['chg']:+.1f}%）\n{r['url']}")
+            if any(b in r["title"] for b in BAD):
+                msg = msg.replace("【登録銘柄のIR】", "【登録銘柄のIR・要注意】")
+            watch_msgs.append(msg)
+        # ニュース（1時間に1回）
+        if (now - dt.datetime.fromisoformat(state.get("wnews_last", "2000-01-01T00:00:00+09:00"))).total_seconds() >= 3600:
+            for n_ in watch_news(watch, names, now):
+                k = hkey("news", n_["code"], n_["title"])
+                if k in wseen:
+                    continue
+                wseen.add(k)
+                watch_msgs.append(f"【登録銘柄のニュース】{n_['code']} {n_['name']}\n{n_['title']}"
+                                  f"（{n_['when']:%m/%d %H:%M}）")
+            state["wnews_last"] = now.isoformat()
+        # 決算発表の前日（18時以降）と当日の朝
+        sched = load_kessan_schedule(state, today)
+        for c in watch:
+            d = sched.get(hkey("code", c))
+            if not d:
+                continue
+            dd = dt.date.fromisoformat(d)
+            for label, cond in (("明日", dd == today + dt.timedelta(days=1) and now.hour >= 18),
+                                ("今日", dd == today and 7 <= now.hour < 15)):
+                k = hkey("kessan", c, d, label)
+                if cond and k not in wseen:
+                    wseen.add(k)
+                    watch_msgs.append(f"【登録銘柄の決算】{c} {names.get(c, '')} は{label}（{dd:%m/%d}）決算発表予定です。"
+                                      f"持ち越すかどうか確認してください。")
+        state["wseen"] = list(wseen)[-3000:]
+        print(f"\n■ 登録銘柄 {len(watch)}件 → 通知 {len(watch_msgs)}件")
+
     # ---- ニュースのテーマ株（1時間に1回） ----
     last = state.get("theme_last")
     due = True
@@ -811,6 +956,21 @@ def main():
 
     # ---- ⑤ Discordに送る（60点以上を全部、すぐに） ----
     discord = os.environ.get("DISCORD_WEBHOOK", "").strip()
+    # 登録銘柄の知らせは、自分専用のDiscord（為替メモ）とLINEに送る（株アラートのDiscordは友だちと共有するため）
+    if send and watch_msgs:
+        private = os.environ.get("DISCORD_PRIVATE_WEBHOOK", "").strip()
+        if private:
+            send_discord(private, watch_msgs)
+        night_now = now.hour >= NIGHT_HOURS[0] or now.hour < NIGHT_HOURS[1]
+        important = [m for m in watch_msgs if "ニュース" not in m]
+        if important and not night_now:
+            send_line(token, user_id, ["\n\n――――――\n\n".join(important)[:4900]])
+            m_ = now.strftime("%Y-%m")
+            state["push_month"][m_] = state["push_month"].get(m_, 0) + 1
+            state["push"][key] = state["push"].get(key, 0) + 1
+        elif important:
+            for m in important:
+                state.setdefault("pending", []).append({"score": 100, "text": m, "at": now.isoformat(), "night": True})
     if send and discord and alerts:
         ds, dcodes = [], set()
         for a in sorted(alerts, key=lambda a: a["score"], reverse=True):
