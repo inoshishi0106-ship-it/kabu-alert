@@ -735,6 +735,209 @@ def watch_news(codes, names, now):
     return out
 
 
+# ---------------- ⑦ 資金流入の候補（毎日の引け後） ----------------
+FLOW_TOP = 8               # 1日に知らせる最大件数
+FLOW_MIN_TURNOVER = 2e8    # 売買代金がこれ以上（2億円）の銘柄だけ
+
+
+def money_flow_screen(jpx, now):
+    """5000円以下の全銘柄から「出来高が急増・引けが強い・まだ上がりすぎていない・買い集めの跡」がある銘柄を探す。"""
+    import pandas as pd
+    codes = list(jpx.keys())
+    rows = []
+    for i in range(0, len(codes), 150):
+        chunk = codes[i:i + 150]
+        try:
+            df = yf.download(" ".join(c + ".T" for c in chunk), period="3mo", interval="1d",
+                             group_by="ticker", threads=True, progress=False, auto_adjust=False)
+        except Exception as e:
+            print(f"  （株価の一括取得でエラー: {e}）")
+            continue
+        for c in chunk:
+            try:
+                d = df[c + ".T"].dropna()
+            except Exception:
+                continue
+            if len(d) < 25:
+                continue
+            last = d.iloc[-1]
+            if last.name.date() != now.date():
+                continue                      # 今日の足がまだ無い銘柄（売買なし等）は外す
+            close, vol = float(last["Close"]), float(last["Volume"])
+            if close > PRICE_MAX or close <= 0:
+                continue
+            avg = float(d["Volume"].iloc[-21:-1].mean())
+            turnover = close * vol
+            if avg <= 0 or turnover < FLOW_MIN_TURNOVER:
+                continue
+            vr = vol / avg
+            chg = (close / float(d["Close"].iloc[-2]) - 1) * 100
+            rng = float(last["High"] - last["Low"])
+            pos = (close - float(last["Low"])) / rng if rng > 0 else 0.5
+            chg10 = (close / float(d["Close"].iloc[-11]) - 1) * 100
+            # 買い集めの指標（チャイキン・マネーフロー20日）: +なら資金流入ぎみ
+            hl = (d["High"] - d["Low"]).replace(0, float("nan"))
+            mfm = ((d["Close"] - d["Low"]) - (d["High"] - d["Close"])) / hl
+            cmf = float((mfm.fillna(0) * d["Volume"]).iloc[-20:].sum() / d["Volume"].iloc[-20:].sum())
+            if vr >= 2.5 and -1.0 <= chg <= 6.0 and pos >= 0.6 and chg10 <= 12 and cmf >= 0.05:
+                score = vr * (0.5 + pos) * (1 + cmf * 3)
+                rows.append(dict(code=c, name=jpx.get(c, ""), close=close, chg=chg, vr=vr, turnover=turnover,
+                                 pos=pos, chg10=chg10, cmf=cmf, score=score))
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows[:FLOW_TOP]
+
+
+def format_flow(rows, now):
+    if not rows:
+        return None
+    L = [f"【資金流入の候補】{now:%m/%d} 引け後（翌日以降の候補・{len(rows)}件）",
+         "出来高が急増し、引けが強く、まだ上がりすぎていない銘柄です。moomooの注文・約定分析で大口の買いも確かめてください。", ""]
+    for r in rows:
+        L.append(f"■ {r['code']} {r['name']} {r['close']:,.0f}円（{r['chg']:+.1f}%）")
+        L.append(f"  出来高 平均の{r['vr']:.1f}倍・売買代金 {r['turnover'] / 1e8:,.0f}億円・"
+                 f"終値は値幅の上から{(1 - r['pos']) * 100:.0f}%の位置")
+        L.append(f"  10日で{r['chg10']:+.1f}%・買い集めの指標 {r['cmf']:+.2f}"
+                 + ("（強い）" if r["cmf"] >= 0.2 else ""))
+    return "\n".join(L)
+
+
+# ---------------- ⑧ 大量保有報告書（EDINET） ----------------
+EDINET_LIST = "https://api.edinet-fsa.go.jp/api/v2/documents.json"
+EDINET_CODES_FILE = "edinet_codes.json"
+
+
+def load_edinet_codes(today, key):
+    """EDINETコード → 証券コード の対応表。1週間に1回だけ取り直す。"""
+    try:
+        d = json.load(open(EDINET_CODES_FILE, encoding="utf-8"))
+        if (today - dt.date.fromisoformat(d["date"])).days < 7:
+            return d["map"]
+    except Exception:
+        d = {"map": {}}
+    m = dict(d.get("map", {}))
+    try:
+        import zipfile
+        import pandas as pd
+        url = "https://disclosure2dl.edinet-fsa.go.jp/searchdocument/codelist/Edinetcode.zip"
+        r = requests.get(url, headers=HEADERS, timeout=60)
+        r.raise_for_status()
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        name = [n for n in z.namelist() if n.lower().endswith(".csv")][0]
+        df = pd.read_csv(z.open(name), encoding="cp932", skiprows=1, dtype=str)
+        for _, row in df.iterrows():
+            ec, sc = str(row.iloc[0]).strip(), str(row.get("証券コード", "")).strip()
+            if ec.startswith("E") and len(sc) >= 4 and sc != "nan":
+                m[ec] = sc[:4]
+        json.dump({"date": today.isoformat(), "map": m}, open(EDINET_CODES_FILE, "w", encoding="utf-8"))
+    except Exception as e:
+        print(f"  （EDINETコードの一覧を取得できませんでした: {e}）")
+    return m
+
+
+def holding_ratio(doc_id, key):
+    """報告書の中身（CSV）から、今回と前回の保有割合を探す。取れなければ (None, None)。"""
+    try:
+        import zipfile
+        r = requests.get(f"https://api.edinet-fsa.go.jp/api/v2/documents/{doc_id}",
+                         params={"type": 5, "Subscription-Key": key}, timeout=60)
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        now_r = prev_r = None
+        for n in z.namelist():
+            if not n.lower().endswith(".csv"):
+                continue
+            raw = z.read(n)
+            try:
+                text = raw.decode("utf-16")
+            except Exception:
+                text = raw.decode("utf-8", "ignore")
+            for line in text.splitlines():
+                if "保有割合" not in line:
+                    continue
+                nums = re.findall(r"(\d+(?:\.\d+)?)", line.split("\t")[-1] if "\t" in line else line[-30:])
+                if not nums:
+                    continue
+                v = float(nums[-1])
+                v = v * 100 if v < 1 else v
+                if "直前" in line or "前回" in line or "LastReport" in line:
+                    prev_r = prev_r if prev_r is not None else v
+                elif now_r is None:
+                    now_r = v
+        return now_r, prev_r
+    except Exception:
+        return None, None
+
+
+def large_holding_alerts(state, now, jpx):
+    """今日と昨日に出た大量保有報告書・変更報告書から、買い増し・新規の5%超えを探す。"""
+    key = os.environ.get("EDINET_API_KEY", "").strip()
+    if not key:
+        return []
+    today = now.date()
+    seen = set(state.get("edinet_seen", []))
+    codes = load_edinet_codes(today, key)
+    learned = False
+    out = []
+    for back in (0, 1):
+        day = today - dt.timedelta(days=back)
+        try:
+            r = requests.get(EDINET_LIST, params={"date": day.isoformat(), "type": 2, "Subscription-Key": key},
+                             timeout=60)
+            res = r.json().get("results", []) or []
+        except Exception as e:
+            print(f"  （EDINETの書類一覧を取得できませんでした: {e}）")
+            continue
+        for d in res:              # 会社自身の提出書類から、コードの対応を覚えておく（一覧が取れない時の予備）
+            if d.get("edinetCode") and d.get("secCode") and d["edinetCode"] not in codes:
+                codes[d["edinetCode"]] = str(d["secCode"])[:4]
+                learned = True
+        for d in res:
+            desc = d.get("docDescription") or ""
+            if not ("大量保有報告書" in desc or "変更報告書" in desc) or "訂正" in desc:
+                continue
+            doc = d.get("docID")
+            if not doc or doc in seen:
+                continue
+            seen.add(doc)
+            try:
+                sub = dt.datetime.strptime(d.get("submitDateTime") or "", "%Y-%m-%d %H:%M").replace(tzinfo=JST)
+            except Exception:
+                sub = now
+            if now - sub > dt.timedelta(hours=MAX_AGE_HOURS):
+                continue                     # 古い報告（初回の実行など）は送らない
+            target = d.get("subjectEdinetCode") or d.get("issuerEdinetCode") or ""
+            code = codes.get(target)
+            if not code:
+                continue
+            info = price_info(code)
+            if not info or info["close"] > PRICE_MAX:
+                continue
+            now_r, prev_r = holding_ratio(doc, key)
+            new = "大量保有報告書" in desc and "変更" not in desc
+            if prev_r is not None and now_r is not None and now_r < prev_r:
+                continue                     # 買い材料だけ（保有を減らした報告は送らない）
+            if new:
+                head, score = "【大口が5%超え取得】", 80
+            else:
+                head, score = "【大口が買い増し】", 74
+            ratio = (f"保有割合 {prev_r:.2f}% → {now_r:.2f}%" if now_r is not None and prev_r is not None
+                     else f"保有割合 {now_r:.2f}%" if now_r is not None else "保有割合は報告書で確認してください")
+            text = (f"{head}{code} {jpx.get(code, '') if jpx else ''}\n"
+                    f"報告した人: {d.get('filerName', '')}\n"
+                    f"{ratio}（{desc}・{(d.get('submitDateTime') or '')[:16]}提出）\n"
+                    f"株価 {info['close']:.0f}円（{info['chg']:+.1f}%） 出来高 {info['vol']:.1f}倍\n"
+                    f"※報告は取得から最大5営業日後です。EDINETで書類番号 {doc} を確認できます")
+            out.append({"score": score, "text": text, "code": code})
+    state["edinet_seen"] = list(seen)[-3000:]
+    if learned:
+        try:
+            d = json.load(open(EDINET_CODES_FILE, encoding="utf-8"))
+        except Exception:
+            d = {"date": "2000-01-01"}
+        d["map"] = codes
+        json.dump(d, open(EDINET_CODES_FILE, "w", encoding="utf-8"))
+    return out
+
+
 # ---------------- LINE ----------------
 def send_discord(url, texts):
     """Discordのウェブフックに送る。1通2000文字までなので、詰めて分ける。回数制限なし（無料）。"""
@@ -953,6 +1156,28 @@ def main():
         state["theme_last"] = now.isoformat()
     else:
         print("\n■ ニュースのテーマ株チェックは、今回はお休み（1時間に1回／7時〜22時）")
+
+    # ---- ⑦ 資金流入の候補（平日の16時以降に1日1回） ----
+    if now.weekday() < 5 and now.hour >= 16 and state.get("flow_done") != key:
+        try:
+            jpx_all = load_jpx(today) or {}
+            fl = money_flow_screen(jpx_all, now) if jpx_all else []
+            txt = format_flow(fl, now)
+            print(f"\n■ 資金流入の候補: {len(fl)}件")
+            if txt:
+                alerts.append({"score": 72, "text": txt, "code": None})
+            state["flow_done"] = key
+        except Exception as e:
+            print(f"  資金流入の候補でエラー: {e}")
+
+    # ---- ⑧ 大量保有報告書（大口の5%超え・買い増し） ----
+    try:
+        lh = large_holding_alerts(state, now, load_jpx(today))
+        if lh:
+            print(f"\n■ 大量保有報告書: {len(lh)}件")
+        alerts += lh
+    except Exception as e:
+        print(f"  大量保有報告書でエラー: {e}")
 
     # ---- ⑤ Discordに送る（60点以上を全部、すぐに） ----
     discord = os.environ.get("DISCORD_WEBHOOK", "").strip()
